@@ -1,0 +1,464 @@
+import requests
+from bs4 import BeautifulSoup
+import datetime
+import re
+from collections import Counter
+import pandas as pd
+import matplotlib.pyplot as plt
+from wordcloud import WordCloud
+from urllib.parse import urlparse
+
+import torch
+from transformers import ElectraTokenizer, ElectraForSequenceClassification
+
+# -----------------------------
+# 기본 설정
+# -----------------------------
+plt.rc('font', family='AppleGothic')
+plt.rcParams['axes.unicode_minus'] = False
+
+HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
+
+
+# -----------------------------
+# URL 유틸: 모바일 → 데스크톱
+# -----------------------------
+def to_desktop_url(url: str) -> str:
+    parsed = urlparse(url)
+    if "n.news.naver.com" in parsed.netloc:
+        parts = parsed.path.split('/')
+        if len(parts) >= 5 and parts[1] == 'mnews' and parts[2] == 'article':
+            oid = parts[3]
+            aid = parts[4]
+            return f"https://news.naver.com/main/read.naver?oid={oid}&aid={aid}"
+    return url
+
+
+# -----------------------------
+# 기사 제목 + 본문 크롤링
+# -----------------------------
+def fetch_article_title_and_body(url: str) -> tuple[str, str]:
+    resp = requests.get(url, headers=HEADERS, timeout=10)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    title_tag = (
+        soup.select_one("#title_area span")
+        or soup.select_one("h2#title_area")
+        or soup.select_one("h2.media_end_head_headline")
+        or soup.select_one("h1#title_area")
+        or soup.select_one("meta[property='og:title']")
+    )
+
+    if title_tag is None:
+        title = ""
+    else:
+        if title_tag.name == "meta":
+            title = title_tag.get("content", "").strip()
+        else:
+            title = title_tag.get_text(strip=True)
+
+    cont = (
+        soup.select_one("#articleBodyContents")
+        or soup.select_one("#newsEndContents")
+        or soup.select_one("#dic_area")
+    )
+    if cont is None:
+        return title, ""
+
+    for tag in cont.select("div.end_photo_org, .link_news_photo, script"):
+        tag.decompose()
+
+    body = cont.get_text(strip=True)
+    return title, body
+
+
+# -----------------------------
+# 네이버 뉴스 URL 수집
+# -----------------------------
+def crawl_naver_news_many(category_code: str, pages: int, yyyymmdd: str) -> list[str]:
+    base_url = "https://news.naver.com/main/list.naver"
+    news_links: list[str] = []
+
+    for page in range(1, pages + 1):
+        params = {
+            "mode": "LSD",
+            "mid": "sec",
+            "sid1": category_code,
+            "date": yyyymmdd,
+            "page": page
+        }
+        resp = requests.get(base_url, headers=HEADERS, params=params, timeout=10)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if "/article/" in href:
+                if href.startswith("/"):
+                    href = "https://news.naver.com" + href
+                news_links.append(href)
+
+    return news_links
+
+
+# -----------------------------
+# 전처리 & 토큰화(단어 빈도용)
+# -----------------------------
+STOPWORDS = {
+    '이','의','에','가','를','은','는','과','와','다','것','수','들','그','등','더','로','있고','함께','더욱',
+    '지금','이런','그런','있는','우리','당시','가능성','관련','하며','하면서','때문','등을','많은','저는','있으며',
+    '몇','이번','지난','또한','예정','위해','하도록','없이','때','으로','대한','정책','모든','역시','등이','등에',
+    '정치','국민','정부','의원','기자','보도','전','통해','직접','결과','가장','만큼','경우','특히','이후','위한',
+    '오늘','내일','내부','하지만','그리고','했다','한다','것이라고','때문에','이제','여러','어떻게','있다','것으로',
+
+    # (정치 워드클라우드에서 자주 뜨는 것들)
+    '대통령','대통령이','대통령은','대통령도','대통령의',
+    '대통령실','대통령실이','대통령실은',
+    '한국','미국','중국','일본','북한','평양',
+    '더불어민주당','민주당','민주당은','민주당이',
+    '국민의힘','국민의힘은','국민의힘이',
+    '특검','특검이','특검은','특검을','특검에','특검과','특검도',
+    '의혹','의혹이','의혹을','의혹은',
+    '대표','대표는','대표가','의원은','의원','장관','사장',
+    '검찰','경찰','수사','발언','주장','입장','보고','공식','업무',
+    '한다고','한다는','없다고','있다고','있다는','있는지','있도록',
+    '이어','이어도','이어지','이어지는','이어진','이어질',
+    '따라','따르면','따른','이같이','이렇게','다만','또는','또한',
+    '가운데','어느','같은','다른','필요한','문제','제대로',
+    '년','월','일','이날','전날','지난해','올해','내년','작년','동안',
+
+    # 영어 잔여
+    'of','and','to','the','in','on','is','that','for','with','said','she','her','their'
+}
+
+def tokenize(text: str) -> list[str]:
+    if not isinstance(text, str):
+        return []
+
+    cleaned = re.sub(r"[^\w\s]", " ", text)
+    pieces = cleaned.split()
+
+    tokens: list[str] = []
+    for w in pieces:
+        if w in STOPWORDS:
+            continue
+        if w.isdigit():
+            continue
+        if len(w) <= 1:
+            continue
+        tokens.append(w)
+
+    return tokens
+
+
+# -----------------------------
+# KoELECTRA 감성(Truncation)
+# -----------------------------
+def get_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+class KoElectraSentimentTrunc:
+    def __init__(self, model_name: str, max_length: int = 512):
+        self.model_name = model_name
+        self.max_length = max_length
+        self.device = get_device()
+
+        self.tokenizer = ElectraTokenizer.from_pretrained(model_name)
+        self.model = ElectraForSequenceClassification.from_pretrained(model_name)
+        self.model.to(self.device)
+        self.model.eval()
+
+    def predict_pos_prob(self, texts: list[str], batch_size: int = 16) -> list[float]:
+        results: list[float] = []
+
+        with torch.no_grad():
+            for start in range(0, len(texts), batch_size):
+                batch_texts = texts[start:start + batch_size]
+
+                encoded = self.tokenizer(
+                    batch_texts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=self.max_length
+                )
+                encoded = {k: v.to(self.device) for k, v in encoded.items()}
+
+                logits = self.model(**encoded).logits
+                probs_pos = torch.softmax(logits, dim=-1)[:, 1].detach().cpu().tolist()
+
+                for p in probs_pos:
+                    results.append(float(p))
+
+        return results
+
+
+def posprob_to_score(pos_prob: float) -> float:
+    if pd.isna(pos_prob):
+        return float("nan")
+    return float(pos_prob) * 2.0 - 1.0
+
+
+def posprob_to_label(pos_prob: float) -> str:
+    if pd.isna(pos_prob):
+        return "unknown"
+    if pos_prob >= 0.5:
+        return "positive"
+    return "negative"
+
+
+def save_category_stats(df: pd.DataFrame, out_csv: str) -> None:
+    rows = []
+    for cat, g in df.groupby("category_name"):
+        rows.append({
+            "category": cat,
+            "n_articles": int(g.shape[0]),
+            "avg_score_small": float(g["sentiment_score_small"].dropna().mean()),
+            "avg_score_base": float(g["sentiment_score_base"].dropna().mean()),
+        })
+
+    stats = pd.DataFrame(rows).sort_values(by="n_articles", ascending=False)
+    stats.to_csv(out_csv, index=False, encoding="utf-8-sig")
+    print(f"{out_csv} 저장 완료\n")
+
+
+# -----------------------------
+# (추가) 본문 길이 통계 계산
+# -----------------------------
+def compute_body_length_stats(bodies: list[str]) -> dict:
+    lengths_all = [len(b) if isinstance(b, str) else 0 for b in bodies]
+    lengths_nonempty = [L for L in lengths_all if L > 0]
+
+    failed_count = 0
+    for L in lengths_all:
+        if L == 0:
+            failed_count += 1
+
+    if len(lengths_nonempty) == 0:
+        return {
+            "total_chars": 0,
+            "avg_len": 0,
+            "max_len": 0,
+            "min_len": 0,
+            "success_count": 0,
+            "fail_count": failed_count
+        }
+
+    total_chars = sum(lengths_nonempty)
+    avg_len = int(round(total_chars / len(lengths_nonempty)))
+    max_len = max(lengths_nonempty)
+    min_len = min(lengths_nonempty)
+
+    return {
+        "total_chars": total_chars,
+        "avg_len": avg_len,
+        "max_len": max_len,
+        "min_len": min_len,
+        "success_count": len(lengths_nonempty),
+        "fail_count": failed_count
+    }
+
+
+def yyyymmdd_to_korean(yyyymmdd: str) -> str:
+    dt = datetime.datetime.strptime(yyyymmdd, "%Y%m%d").date()
+    return f"{dt.year}년 {dt.month}월 {dt.day}일"
+
+
+# -----------------------------
+# main
+# -----------------------------
+if __name__ == "__main__":
+    categories = {
+        "정치": "100",
+        "경제": "101",
+        "사회": "102",
+        "생활/문화": "103",
+        "세계": "104",
+        "IT/과학": "105"
+    }
+
+    print("카테고리 선택:")
+    for name, code in categories.items():
+        print(f"  {name} ({code})")
+
+    code = input("카테고리 코드를 입력하세요: ").strip()
+    if code not in categories.values():
+        print("잘못된 코드입니다.")
+        raise SystemExit(1)
+
+    pages = int(input("url을 가져올 페이지 개수를 입력하세요: ").strip())
+
+    # 날짜(네이버 리스트에 넣는 날짜)
+    today_yyyymmdd = datetime.date.today().strftime("%Y%m%d")
+    today_kor = yyyymmdd_to_korean(today_yyyymmdd)
+
+    # 카테고리명 역매핑
+    category_name = "Unknown"
+    for k, v in categories.items():
+        if v == code:
+            category_name = k
+            break
+
+    # -----------------------------
+    # 1) URL 수집 + 원시 URL 수 산출(추가)
+    # -----------------------------
+    print("\nURL 수집 중...")
+    raw_urls = crawl_naver_news_many(code, pages=pages, yyyymmdd=today_yyyymmdd)
+    raw_url_count = len(raw_urls)
+
+    # -----------------------------
+    # 2) 중복 제거(모바일→데스크톱 변환 포함)
+    # -----------------------------
+    seen = set()
+    unique_urls: list[str] = []
+    for u in raw_urls:
+        desktop = to_desktop_url(u)
+        if desktop not in seen:
+            seen.add(desktop)
+            unique_urls.append(desktop)
+
+    unique_url_count = len(unique_urls)
+    print(f"총 {unique_url_count}개 고유 URL을 수집했습니다.\n")
+
+    # -----------------------------
+    # 3) 제목/본문 크롤링
+    # -----------------------------
+    titles: list[str] = []
+    bodies: list[str] = []
+
+    for i, url in enumerate(unique_urls, start=1):
+        try:
+            title, body = fetch_article_title_and_body(url)
+        except Exception as e:
+            print(f"[{i}/{unique_url_count}] 실패: {url}\n    {e}")
+            title, body = "", ""
+        else:
+            preview = body[:100].replace("\n", " ")
+            print(f"[{i}/{unique_url_count}] 성공: {url}\n    제목: {title[:60]}...\n    길이: {len(body)}자, 미리보기: {preview}…\n")
+
+        titles.append(title)
+        bodies.append(body)
+
+    # -----------------------------
+    # 4) (추가) 본문 길이 통계 출력
+    # -----------------------------
+    stats = compute_body_length_stats(bodies)
+
+    print("==== 데이터 수집 현황(자동 계산) ====")
+    print(f"크롤링 페이지 수: {pages:,}페이지")
+    print(f"원시 URL 수: {raw_url_count:,}개 (중복 포함)")
+    print(f"고유 URL 수: {unique_url_count:,}개 (모바일→데스크톱 변환 후 중복 제거)")
+    print(f"크롤링 성공 본문 수: {stats['success_count']:,}개 / 실패(빈 본문) 수: {stats['fail_count']:,}개")
+    print(f"본문 총 문자 수: {stats['total_chars']:,}자")
+    print(f"본문 평균 길이: {stats['avg_len']:,}자 (최대 {stats['max_len']:,}자, 최소 {stats['min_len']:,}자)")
+    print(f"날짜: {today_kor}")
+    print("===================================\n")
+
+    # 통계도 파일로 남기기(추가)
+    summary_df = pd.DataFrame([{
+        "category": category_name,
+        "date": today_kor,
+        "pages": pages,
+        "raw_url_count": raw_url_count,
+        "unique_url_count": unique_url_count,
+        "body_success_count": stats["success_count"],
+        "body_fail_count": stats["fail_count"],
+        "body_total_chars": stats["total_chars"],
+        "body_avg_len": stats["avg_len"],
+        "body_max_len": stats["max_len"],
+        "body_min_len": stats["min_len"],
+    }])
+    summary_df.to_csv("crawl_summary.csv", index=False, encoding="utf-8-sig")
+    print("crawl_summary.csv 저장 완료\n")
+
+    # -----------------------------
+    # 5) 단어 빈도 분석 + 워드클라우드
+    # -----------------------------
+    all_words: list[str] = []
+    for b in bodies:
+        all_words.extend(tokenize(b))
+
+    counter = Counter(all_words)
+
+    print("상위 20개 단어:")
+    for w, f in counter.most_common(20):
+        print(f"  {w}: {f}")
+
+    pd.DataFrame(counter.most_common(), columns=["word", "freq"]) \
+        .to_csv("word_frequency.csv", index=False, encoding="utf-8-sig")
+    print("word_frequency.csv 저장 완료\n")
+
+    if len(counter) > 0:
+        wc = WordCloud(
+            width=800,
+            height=600,
+            background_color="white",
+            font_path="/System/Library/Fonts/AppleGothic.ttf"
+        ).generate_from_frequencies(counter)
+
+        plt.figure(figsize=(10, 8))
+        plt.imshow(wc, interpolation="bilinear")
+        plt.axis("off")
+        plt.tight_layout()
+        plt.show()
+
+        wc.to_file("wordcloud.png")
+        print("wordcloud.png 저장 완료\n")
+
+    # -----------------------------
+    # 6) KoELECTRA 감성 분석(small vs base, truncation)
+    # -----------------------------
+    df = pd.DataFrame({
+        "category_name": [category_name] * len(unique_urls),
+        "url": unique_urls,
+        "title": titles,
+        "body": bodies
+    })
+    df["text_for_sentiment"] = (df["title"].fillna("") + "\n" + df["body"].fillna("")).str.strip()
+
+    MODEL_SMALL = "monologg/koelectra-small-finetuned-nsmc"
+    MODEL_BASE = "monologg/koelectra-base-finetuned-nsmc"
+
+    print("KoELECTRA(SMALL) 로딩 및 감성 계산 중 (truncation)...")
+    senti_small = KoElectraSentimentTrunc(MODEL_SMALL, max_length=512)
+    df["pos_prob_small"] = senti_small.predict_pos_prob(df["text_for_sentiment"].tolist(), batch_size=16)
+    df["sentiment_score_small"] = df["pos_prob_small"].apply(posprob_to_score)
+    df["sentiment_label_small"] = df["pos_prob_small"].apply(posprob_to_label)
+
+    print("KoELECTRA(BASE) 로딩 및 감성 계산 중 (truncation)...")
+    senti_base = KoElectraSentimentTrunc(MODEL_BASE, max_length=512)
+    df["pos_prob_base"] = senti_base.predict_pos_prob(df["text_for_sentiment"].tolist(), batch_size=8)
+    df["sentiment_score_base"] = df["pos_prob_base"].apply(posprob_to_score)
+    df["sentiment_label_base"] = df["pos_prob_base"].apply(posprob_to_label)
+
+    avg_small = float(df["sentiment_score_small"].dropna().mean())
+    avg_base = float(df["sentiment_score_base"].dropna().mean())
+
+    print(f"\n평균 감성 점수 SMALL (-1~+1): {avg_small:.4f}")
+    print(f"평균 감성 점수 BASE  (-1~+1): {avg_base:.4f}\n")
+
+    df.to_csv("news_sentiment.csv", index=False, encoding="utf-8-sig")
+    print("news_sentiment.csv 저장 완료 (title/body/두 모델 결과 포함)\n")
+
+    save_category_stats(df, "category_sentiment_stats.csv")
+
+    # 감성 분포 시각화
+    plt.figure(figsize=(6, 4))
+    df["sentiment_score_small"].dropna().plot(kind="hist", bins=10, alpha=0.6, label="small")
+    df["sentiment_score_base"].dropna().plot(kind="hist", bins=10, alpha=0.6, label="base")
+    plt.title("뉴스 감성 분포 (KoELECTRA small vs base, truncation)")
+    plt.xlabel("감성 점수(-1~+1)")
+    plt.ylabel("기사 수")
+    plt.axvline(avg_small, linestyle="--", label=f"small avg {avg_small:.2f}")
+    plt.axvline(avg_base, linestyle="--", label=f"base avg {avg_base:.2f}")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    print("완료 ✅")
